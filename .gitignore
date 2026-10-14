@@ -1,0 +1,7 @@
+bin/
+obj/
+build/
+artifacts/
+*.user
+.vs/
+.idea/

@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="src/Qwen35Sharp.Gguf/Qwen35Sharp.Gguf.csproj" />
+  <Project Path="src/Qwen35Sharp.Kernels/Qwen35Sharp.Kernels.csproj" />
+  <Project Path="src/Qwen35Sharp.Model/Qwen35Sharp.Model.csproj" />
+  <Project Path="src/Qwen35Sharp.Cli/Qwen35Sharp.Cli.csproj" />
+  <Project Path="tests/Qwen35Sharp.Tests/Qwen35Sharp.Tests.csproj" />
+</Solution>

@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Qwen3.5 hybrid (Gated-DeltaNet + full attention) CPU inference: load GGUF, tokenize, Forward.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Qwen35Sharp.Kernels\Qwen35Sharp.Kernels.csproj" />
+    <ProjectReference Include="..\Qwen35Sharp.Gguf\Qwen35Sharp.Gguf.csproj" />
+  </ItemGroup>
+</Project>

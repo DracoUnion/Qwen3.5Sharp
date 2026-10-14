@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Qwen35Sharp.Model\Qwen35Sharp.Model.csproj" />
+    <ProjectReference Include="..\Qwen35Sharp.Gguf\Qwen35Sharp.Gguf.csproj" />
+  </ItemGroup>
+</Project>
