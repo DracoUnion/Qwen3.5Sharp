@@ -19,7 +19,6 @@ public sealed unsafe partial class Qwen35Model : IDisposable
     private readonly List<NativeBuffer> _buffers = [];
     private NativeBuffer? _scratch;
     private int _scratchUsed;
-    private nuint _scratchCap;
 
     // KV cache (full-attention layers only).
     private readonly float*[] _cacheK;
@@ -107,14 +106,14 @@ public sealed unsafe partial class Qwen35Model : IDisposable
         long stateBytes = (long)linHeads * linHeadDim * linVHeadDim * sizeof(float);
         int stateLen = Math.Max(1, Config.SsmConvKernel - 1);
         long convBytes = (long)stateLen * Config.LinearConvDim * sizeof(float);
-        NativeBuffer sb = Rent((nuint)stateBytes);
-        NativeBuffer cb = Rent((nuint)convBytes);
+        NativeBuffer sb = Rent((nuint)((long)Config.NumLayers * stateBytes));
+        NativeBuffer cb = Rent((nuint)((long)Config.NumLayers * convBytes));
         _linStateBuffer = sb;
         _linConvBuffer = cb;
         for (int l = 0; l < Config.NumLayers; l++)
         {
-            _linState[l] = (float*)sb.Pointer + (long)l * stateBytes;
-            _linConv[l] = (float*)cb.Pointer + (long)l * convBytes;
+            _linState[l] = (float*)((byte*)sb.Pointer + (long)l * stateBytes);
+            _linConv[l] = (float*)((byte*)cb.Pointer + (long)l * convBytes);
         }
 
         // KV cache only for full-attention layers.
@@ -136,28 +135,8 @@ public sealed unsafe partial class Qwen35Model : IDisposable
             _cacheV[l] = (float*)v.Pointer;
         }
 
-        // Size the per-layer scratch arena to the worst-case single-layer usage
-        // over the *capped* context length. One forward pass allocates, per
-        // layer: two norm buffers + an attention/linear output, the layer's
-        // internal activations, and the FFN gate/up/down. We size for the
-        // largest of (linear, full) layer internals plus the FFN, so Bump
-        // never regrows mid-layer and never invalidates in-flight pointers.
-        int ctx = _cacheCap;
-        int hidden = Config.HiddenSize;
-        int ffn = Config.FfnSize;
-        long linInternal =
-            (long)ctx * Config.LinearConvDim * 4 * sizeof(float)   // qkv + z (qkv dominates)
-            + (long)ctx * Config.LinearConvDim * 2 * sizeof(float)  // qkvCh + convOutCh
-            + (long)ctx * (Config.LinearKeyDim + Config.LinearKeyDim + Config.LinearValueDim) * sizeof(float) // qSm/kSm/vSm
-            + (long)ctx * Config.SsmTimeStepRank * (4 + 4 + 2 * Config.SsmStateSize) * sizeof(float); // bOut,aOut,betaP,gP,out_,gated
-        long fullInternal =
-            (long)ctx * 2 * Config.FullQDim * sizeof(float)          // qGateBuf
-            + (long)ctx * Config.FullQDim * 2 * sizeof(float)       // q + gate
-            + (long)Config.NumHeads * ctx * ctx * sizeof(float)      // scores (upper bound)
-            + (long)ctx * Config.FullQDim * sizeof(float);          // ao
-        long ffnScratch = (long)ctx * (ffn + ffn + hidden) * sizeof(float);
-        long normScratch = (long)ctx * hidden * 3 * sizeof(float);
-        _scratchCap = (nuint)(Math.Max(linInternal, fullInternal) + ffnScratch + normScratch + 1024 * 1024);
+        // Scratch is sized lazily per Forward call from the actual sequence length.
+        // This avoids reserving gigabytes for the configured context window.
     }
 
     public int CacheLength => _cacheLen;
@@ -199,6 +178,7 @@ public sealed unsafe partial class Qwen35Model : IDisposable
         int seq = tokens.Length;
         int start = _cacheLen;
         EnsureCache(start + seq);
+        EnsureScratch(seq, start + seq);
         int hidden = Config.HiddenSize;
         float* h = (float*)Bump((nuint)((long)seq * hidden * sizeof(float)));
         Embed(tokens, h);
@@ -304,22 +284,59 @@ public sealed unsafe partial class Qwen35Model : IDisposable
         return buf;
     }
 
+    /// <summary>
+    /// Grow the per-layer scratch arena so a single layer forward never regrows
+    /// mid-call (which would invalidate already-issued pointers). Sizes from the
+    /// actual tokens processed this call and the current KV length, not the
+    /// configured context window.
+    /// </summary>
+    private void EnsureScratch(int seq, int kvLen)
+    {
+        int hidden = Config.HiddenSize;
+        int ffn = Config.FfnSize;
+        int nHeads = Config.SsmTimeStepRank;
+        int vHeadDim = Config.SsmStateSize;
+        int convDim = Config.LinearConvDim;
+        int keyDim = Config.LinearKeyDim;
+        int valueDim = Config.LinearValueDim;
+        int heads = Config.NumHeads;
+        int qDim = Config.FullQDim;
+
+        long linInternal =
+            (long)seq * convDim * sizeof(float)              // qkv
+            + (long)seq * valueDim * sizeof(float)           // z
+            + (long)seq * convDim * 2 * sizeof(float)        // qkvCh + convOutCh
+            + (long)seq * (keyDim + keyDim + valueDim) * sizeof(float) // qSm/kSm/vSm
+            + (long)seq * nHeads * 4 * sizeof(float)         // bOut, aOut, betaP, gP
+            + (long)seq * nHeads * vHeadDim * 2 * sizeof(float) // out_, gated
+            + (long)cached_gather_norm(hidden);              // 2 norms + attn (outside, counted separately)
+        long fullInternal =
+            (long)seq * 2 * qDim * sizeof(float)             // qGateBuf
+            + (long)seq * qDim * 2 * sizeof(float)           // q + gate
+            + (long)heads * seq * kvLen * sizeof(float)       // scores
+            + (long)seq * qDim * sizeof(float);              // ao
+        long ffnScratch = (long)seq * (ffn + ffn + hidden) * sizeof(float);
+        long normScratch = (long)seq * hidden * 3 * sizeof(float);
+        long needed = Math.Max(linInternal, fullInternal) + ffnScratch + normScratch + 4 * 1024 * 1024;
+        if (_scratch == null || (long)_scratch.Bytes < needed)
+            _scratch = Rent((nuint)needed);
+    }
+
+    // Small helper to document the extra norm buffers allocated by DecodeBlock.
+    private static long cached_gather_norm(int hidden) => (long)hidden * 4 * sizeof(float);
+
     private void* Bump(nuint bytes)
     {
-        // The arena is sized (at construction) to hold the worst-case scratch of a
-        // single layer for the full context length, so a regrow never invalidates
-        // pointers already handed out inside the current layer call.
+        // EnsureScratch is called once at the start of each Forward and sizes the
+        // arena for the whole pass, so a regrow mid-call must never happen (it
+        // would invalidate pointers already handed out to the current layer).
         if (_scratch == null)
-            _scratch = Rent(_scratchCap);
+            _scratch = Rent(64 * 1024 * 1024);
         int aligned = (int)((bytes + 63) & ~(nuint)63);
         if (_scratchUsed + aligned > (int)_scratch.Bytes)
-        {
-            // Overflowed the per-layer worst-case estimate; grow. This resets
-            // outstanding pointers, but should be extremely rare (only if the
-            // estimate is too small).
-            _scratch = Rent((nuint)Math.Max((long)_scratch.Bytes, (long)aligned));
-            _scratchUsed = 0;
-        }
+            throw new InsufficientMemoryException(
+                $"Scratch arena overflow: need {_scratchUsed + aligned} of {_scratch.Bytes} bytes. " +
+                "Recompute EnsureScratch sizing for this model.");
         byte* ptr = (byte*)_scratch.Pointer + _scratchUsed;
         _scratchUsed += aligned;
         return ptr;

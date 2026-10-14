@@ -1,43 +1,42 @@
 # Qwen35Sharp
 
-C# / .NET 10 CPU inference engine for **Qwen3.5** GGUF models, built on the
-same skeleton as [HyMT2Sharp](../HyMT2Sharp): a memory-mapped GGUF reader plus
-AVX2/AVX-VNNI quantized GEMM/GEMV kernels.
+面向 **Qwen3.5** GGUF 模型的 C# / .NET 10 CPU 推理引擎，复用了
+[HyMT2Sharp](../HyMT2Sharp) 的骨架：内存映射的 GGUF 读取器，加上
+AVX2/AVX-VNNI 量化的 GEMM/GEMV 算子内核。
 
-Qwen3.5 is a *hybrid* transformer: every fourth layer (1-indexed, i.e. layers
-3, 7, 11, …) is a standard GQA attention layer with a sigmoid attention gate,
-and the remaining layers are **Gated-DeltaNet** linear-attention layers
-(a.k.a. gated SSM). This project implements both, plus the interleaved
-SiLU-FFN, from a `.gguf` file.
+Qwen3.5 是一种**混合** Transformer：每隔四层（从 1 开始计数，即第 3、7、11、
+…… 层）是带 sigmoid 注意力门控的标准 GQA 注意力层，其余层是
+**Gated-DeltaNet** 线性注意力层（又称 gated SSM）。本项目实现了这两种层，
+外加穿插其中的 SiLU-FFN，全部从一个 `.gguf` 文件读取。
 
-## Layout
+## 目录结构
 
-| Project | Purpose |
+| 项目 | 用途 |
 |---------|---------|
-| `Qwen35Sharp.Gguf` | Memory-mapped GGUF v2/v3 reader (tensor + metadata). |
-| `Qwen35Sharp.Kernels` | Quantized `x @ Wᵀ` GEMM/GEMV kernels (Q4_K, Q2_0C, STQ1_0, Q5_K, Q6_K), SIMD pointwise helpers, `CpuThreadPool`. |
-| `Qwen35Sharp.Model` | The Qwen3.5 model: weight loading, KV + recurrent-state caches, prefill & decode forward, BPE tokenizer, chat template. |
-| `Qwen35Sharp.Cli` | Interactive CLI that tokenizes a prompt, prefill + decode loop, and streams the answer. |
-| `Qwen35Sharp.Tests` | xunit tests, including a reference-validated Gated-DeltaNet recurrence. |
+| `Qwen35Sharp.Gguf` | 内存映射的 GGUF v2/v3 读取器（张量 + 元数据）。 |
+| `Qwen35Sharp.Kernels` | 量化 `x @ Wᵀ` GEMM/GEMV 内核（Q4_K、Q2_0C、STQ1_0、Q5_K、Q6_K）、SIMD 逐点算子、`CpuThreadPool`。 |
+| `Qwen35Sharp.Model` | Qwen3.5 模型本体：权重加载、KV 缓存与循环状态缓存、prefill 与 decode 前向计算、BPE 分词器、聊天模板。 |
+| `Qwen35Sharp.Cli` | 交互式命令行程序：对提示词做分词、prefill + decode 循环、流式输出回答。 |
+| `Qwen35Sharp.Tests` | xunit 测试，包含与参考实现对拍的 Gated-DeltaNet 递推测试。 |
 
-## Building
+## 构建
 
-Requires the .NET 10 SDK (the project targets `net10.0`).
+需要 .NET 10 SDK（项目目标框架为 `net10.0`）。
 
 ```
 dotnet build Qwen35Sharp.slnx
 dotnet test  tests/Qwen35Sharp.Tests/Qwen35Sharp.Tests.csproj
 ```
 
-On machines where the .NET 10 SDK is installed to the user profile rather than
-`C:\Program Files`, point MSBuild at it:
+如果机器上的 .NET 10 SDK 装在用户目录而非 `C:\Program Files`，请把 MSBuild
+指向它：
 
 ```
 $env:DOTNET_ROOT = "$env:USERPROFILE\.dotnet"
 dotnet build Qwen35Sharp.slnx
 ```
 
-## Running
+## 运行
 
 ```
 dotnet run --project src/Qwen35Sharp.Cli -- ^
@@ -45,53 +44,50 @@ dotnet run --project src/Qwen35Sharp.Cli -- ^
   --prompt "Say hello"
 ```
 
-An interactive REPL opens when `--prompt` is omitted; `/reset` clears the
-conversation, `/exit` quits.
+省略 `--prompt` 时会进入交互式 REPL；`/reset` 清空对话，`/exit` 退出。
 
-## Qwen3.5 architecture notes
+## Qwen3.5 架构说明
 
-Read from `general.architecture = "qwen35"`:
+从 `general.architecture = "qwen35"` 读取：
 
-* `qwen35.embedding_length`        → hidden size
-* `qwen35.attention.head_count`   → full-attn heads
-* `qwen35.attention.head_count_kv`→ GQA kv heads
-* `qwen35.block_count`            → number of layers
-* `qwen35.full_attention_interval`→ every Nth layer is full attention
-  (default 4); the others are Gated-DeltaNet.
+* `qwen35.embedding_length`         → 隐藏层大小
+* `qwen35.attention.head_count`    → 全注意力头的数量
+* `qwen35.attention.head_count_kv` → GQA 的 KV 头数量
+* `qwen35.block_count`             → 层数
+* `qwen35.full_attention_interval` → 每隔 N 层为一层全注意力
+  （默认 4）；其余层为 Gated-DeltaNet。
 * `qwen35.ssm.conv_kernel` / `inner_size` / `state_size` /
-  `time_step_rank` / `group_count` → Gated-DeltaNet dimensions.
-* `qwen35.rope.*`                 → RoPE base / dimension count.
-* `qwen35.attention.layer_norm_rms_epsilon` → RMSNorm ε.
+  `time_step_rank` / `group_count` → Gated-DeltaNet 的维度。
+* `qwen35.rope.*`                  → RoPE 基频 / 旋转维度。
+* `qwen35.attention.layer_norm_rms_epsilon` → RMSNorm 的 ε。
 
-Per layer:
+每一层：
 
-* **All layers**: `blk.L.attn_norm` → token mixer → residual →
-  `blk.L.post_attention_norm` → SiLU MLP → residual.
-* **Full-attention layer**: `attn_q` (2× output: query ∥ gate), `attn_k`,
-  `attn_v`, `attn_q_norm`, `attn_k_norm` (per-head RMSNorm), partial
-  RoPE, GQA scaled-softmax, then `out = out * sigmoid(gate)` and `attn_output`.
-* **Gated-DeltaNet layer**: `attn_qkv`, `attn_gate`, `ssm_conv1d` (causal
-  depthwise conv1d + SiLU), `ssm_beta` (= β), `ssm_alpha` (= α, with
-  `ssm_dt` bias → softplus), `ssm_a` (= log A, → −exp(A)), gated-RMSNorm
-  (`ssm_norm`), `ssm_out`. The delta-rule recurrence runs over the sequence
-  (prefill) or a single token (decode), updating a per-layer
-  `[heads][k_dim][v_dim]` state buffer; the conv state is a rolling
-  `[k-1][conv_dim]` window.
+* **所有层**：`blk.L.attn_norm` → token 混合器 → 残差 →
+  `blk.L.post_attention_norm` → SiLU MLP → 残差。
+* **全注意力层**：`attn_q`（输出为 2 倍：query ∥ gate）、`attn_k`、
+  `attn_v`、`attn_q_norm`、`attn_k_norm`（按头的 RMSNorm）、部分
+  RoPE、GQA 缩放 softmax，然后 `out = out * sigmoid(gate)` 与 `attn_output`。
+* **Gated-DeltaNet 层**：`attn_qkv`、`attn_gate`、`ssm_conv1d`（因果
+  深度卷积 + SiLU）、`ssm_beta`（= β）、`ssm_alpha`（= α，配合
+  `ssm_dt` 偏置 → softplus）、`ssm_a`（= log A，→ −exp(A)）、门控
+  RMSNorm（`ssm_norm`）、`ssm_out`。delta-rule 递推在序列上运行
+  （prefill）或对单个 token 运行（decode），更新每层的
+  `[heads][k_dim][v_dim]` 状态缓冲；卷积状态是一个滚动
+  `[k-1][conv_dim]` 窗口。
 
-`output.weight` (or tied `token_embd.weight`) produces the final logits.
+`output.weight`（或共享的 `token_embd.weight`）产生最终 logits。
 
-## What is *not* implemented
+## 尚未实现
 
-* **Vision / multimodal** (`Qwen3_5VisionModel`, 3D position ids, M-RoPE
-  sections) — this is a text-only engine. The 1-D `RopeDim` in
-  `ModelConfig` is the partial-rotary dimension; full M-RoPE section
-  handling is out of scope.
-* **MoE** FFN — Qwen3.5 dense uses a standard SiLU FFN.
-* **Speculative decoding / MTP**.
-* The chunked Gated-DeltaNet path — only the sequential recurrence is
-  used (equivalent, matches llama.cpp's per-token decode and is correct for
-  arbitrary-length prefill).
+* **视觉 / 多模态**（`Qwen3_5VisionModel`、3D 位置 id、M-RoPE 分段）——
+  这是一个纯文本引擎。`ModelConfig` 中的 1 维 `RopeDim` 是部分旋转的维度；
+  完整的 M-RoPE 分段处理不在范围内。
+* **MoE** FFN —— Qwen3.5 dense 使用标准的 SiLU FFN。
+* **投机解码 / MTP**。
+* 分块的 Gated-DeltaNet 路径 —— 只使用顺序递推（两者等价，与
+  llama.cpp 的逐 token decode 一致，对任意长度的 prefill 都是正确的）。
 
-## License
+## 许可证
 
-Apache-2.0.
+Apache-2.0。

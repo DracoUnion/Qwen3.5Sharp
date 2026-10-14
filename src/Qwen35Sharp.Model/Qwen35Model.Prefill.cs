@@ -12,26 +12,36 @@ public sealed unsafe partial class Qwen35Model
 
     private void PrefillBlock(float* hidden, int layer, int seq, int start)
     {
+        bool trace = Environment.GetEnvironmentVariable("Q35_TRACE") == "1";
+        void T(string s) { if (trace) Console.Error.WriteLine($"[PB L{layer}] {s}"); }
         int hiddenSize = Config.HiddenSize;
         float* n1 = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         float* attn = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         Rms($"blk.{layer}.attn_norm.weight", hidden, n1, seq, hiddenSize);
+        T("attn_norm ok");
 
         if (Config.IsRecurrent[layer])
             PrefillLinearAttn(n1, attn, layer, seq, start);
         else
             PrefillAttention(n1, attn, layer, seq, start);
+        T("token-mixer ok");
         Ops.AddInPlace(hidden, attn, checked((int)((long)seq * hiddenSize)), _pool);
+        T("residual1 ok");
 
         float* n2 = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         Rms($"blk.{layer}.post_attention_norm.weight", hidden, n2, seq, hiddenSize);
+        T("post_attn_norm ok");
         float* gate = (float*)Bump((nuint)((long)seq * Config.FfnSize * sizeof(float)));
         float* up = (float*)Bump((nuint)((long)seq * Config.FfnSize * sizeof(float)));
         float* down = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         PrefillGateUp(n2, gate, up, layer, seq);
+        T("gateup ok");
         Ops.SiLUMul(gate, up, checked((int)((long)seq * Config.FfnSize)), _pool);
+        T("silu ok");
         Linear(gate, $"blk.{layer}.ffn_down.weight", down, Config.FfnSize, hiddenSize, seq);
+        T("ffn_down ok");
         Ops.AddInPlace(hidden, down, checked((int)((long)seq * hiddenSize)), _pool);
+        T("residual2 ok");
     }
 
     private void PrefillGateUp(float* input, float* gate, float* up, int layer, int seq)
