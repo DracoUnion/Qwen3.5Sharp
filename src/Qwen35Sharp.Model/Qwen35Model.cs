@@ -79,8 +79,8 @@ public sealed unsafe partial class Qwen35Model : IDisposable
     {
         _gguf = new GgufFile(ggufPath);
         Config = ModelConfig.FromGguf(_gguf);
-        if (!string.Equals(Config.Architecture, "qwen35", StringComparison.Ordinal))
-            throw new NotSupportedException($"Expected qwen35, got {Config.Architecture}");
+        if (Config.Architecture is not ("qwen35" or "qwen35moe"))
+            throw new NotSupportedException($"Expected qwen35 or qwen35moe, got {Config.Architecture}");
 
         Tokenizer = new BpeTokenizer(_gguf);
         _pool = new CpuThreadPool(threads);
@@ -141,6 +141,62 @@ public sealed unsafe partial class Qwen35Model : IDisposable
 
     public int CacheLength => _cacheLen;
 
+    /// <summary>Debug: dequantize one token_embd row into <paramref name="dst"/> (hidden floats).</summary>
+    public void EmbedRow(int token, float[] dst)
+    {
+        Weight w = _weights["token_embd.weight"];
+        int hidden = Config.HiddenSize;
+        fixed (float* d = dst)
+        {
+            switch (w.Type)
+            {
+                case GgmlTensorType.Q4_K: Q4K.DequantizeRow(w.Q4 + token * (hidden / Qk.SuperBlock), d, hidden); break;
+                case GgmlTensorType.IQ4_XS: IQ4XS.DequantizeRow(w.Q4xs + token * (hidden / Qk.SuperBlock), d, hidden); break;
+                case GgmlTensorType.F32: Buffer.MemoryCopy(w.F32 + token * hidden, d, hidden * 4, hidden * 4); break;
+                default: throw new NotSupportedException($"token_embd {w.Type}");
+            }
+        }
+    }
+
+    /// <summary>Debug: dequantize one row of any quantized weight into <paramref name="dst"/>.</summary>
+    public void DequantRow(string name, int row, float[] dst)
+    {
+        Weight w = _weights[name];
+        int hidden = Config.HiddenSize;
+        int nb = hidden / Qk.SuperBlock;
+        fixed (float* d = dst)
+        {
+            switch (w.Type)
+            {
+                case GgmlTensorType.Q4_K: Q4K.DequantizeRow(w.Q4 + row * nb, d, hidden); break;
+                case GgmlTensorType.IQ4_XS: IQ4XS.DequantizeRow(w.Q4xs + row * nb, d, hidden); break;
+                case GgmlTensorType.Q6_K: Q6K.DequantizeRow(w.Q6 + row * nb, d, hidden); break;
+                case GgmlTensorType.Q5_K: Q5K.DequantizeRow(w.Q5 + row * nb, d, hidden); break;
+                case GgmlTensorType.F32: Buffer.MemoryCopy(w.F32 + row * hidden, d, hidden * 4, hidden * 4); break;
+                default: throw new NotSupportedException($"dequant {w.Type}");
+            }
+        }
+    }
+
+    /// <summary>Debug: dot a hidden vector with one output.weight (LM head) row.</summary>
+    public float LmHeadDot(float[] h, int row)
+    {
+        Weight w = _weights["output.weight"];
+        int hidden = Config.HiddenSize;
+        int nb = hidden / Qk.SuperBlock;
+        fixed (float* hp = h)
+        {
+            BlockQ8K* q8 = stackalloc BlockQ8K[nb];
+            Q8K.QuantizeRow(hp, q8, hidden);
+            return w.Type switch
+            {
+                GgmlTensorType.Q6_K => Q6K.Dot(w.Q6 + row * nb, q8, hidden),
+                GgmlTensorType.IQ4_XS => IQ4XS.Dot(w.Q4xs + row * nb, q8, hidden),
+                _ => throw new NotSupportedException($"output {w.Type}"),
+            };
+        }
+    }
+
     public void ResetCache()
     {
         TruncateCache(0);
@@ -197,11 +253,30 @@ public sealed unsafe partial class Qwen35Model : IDisposable
             {
                 _scratchUsed = layerMark;
                 PrefillBlock(h, layer, seq, start);
+                if (Environment.GetEnvironmentVariable("Q35_DIAG") == "1")
+                {
+                    // Norm of last token's hidden state at every 3rd layer.
+                    if (layer % 3 == 2)
+                    {
+                        float n2 = 0;
+                        float* lastTok = h + (long)(seq - 1) * hidden;
+                        for (int i = 0; i < hidden; i++)
+                            n2 += lastTok[i] * lastTok[i];
+                        Console.Error.WriteLine($"[diag] prefill after L{layer} ('{(Config.IsRecurrent[layer] ? "linear" : "full")}'): |h_last|={MathF.Sqrt(n2 / hidden):F3}");
+                    }
+                }
             }
         }
 
         float* normed = (float*)Bump((nuint)((long)seq * hidden * sizeof(float)));
         Rms("output_norm.weight", h, normed, seq, hidden);
+        if (Environment.GetEnvironmentVariable("Q35_DIAG") == "1")
+        {
+            float n2 = 0;
+            for (int i = 0; i < seq * hidden; i++)
+                n2 += normed[i] * normed[i];
+            Console.Error.WriteLine($"[diag] after {Config.NumLayers} layers seq={seq}: |h|={MathF.Sqrt(n2 / (seq * hidden)):F4}  |normed|={MathF.Sqrt(n2 / (seq * hidden)):F4}");
+        }
         float* last = normed + (seq - 1) * hidden;
 
         int vocab = Config.VocabSize > 0 ? Config.VocabSize : Tokenizer.VocabSize;
@@ -316,8 +391,16 @@ public sealed unsafe partial class Qwen35Model : IDisposable
             + (long)heads * seq * kvLen * sizeof(float)       // scores
             + (long)seq * qDim * sizeof(float);              // ao
         long ffnScratch = (long)seq * (ffn + ffn + hidden) * sizeof(float);
+        // MoE FFN allocates per token per selected expert a gate/up pair plus a
+        // down, plus the router table and the shared-expert FFN.
+        long moeInternal =
+            (long)seq * Config.NumExperts * sizeof(float)          // router logits
+            + (long)seq * Config.NumExpertsPerTok * (2 * Config.MoeFfnSize + hidden) * sizeof(float)
+            + (long)seq * (2 * Config.MoeSharedFfnSize + hidden + 1) * sizeof(float);
         long normScratch = (long)seq * hidden * 3 * sizeof(float);
-        long needed = Math.Max(linInternal, fullInternal) + ffnScratch + normScratch + 4 * 1024 * 1024;
+        // A layer allocates the attention internal buffers then the FFN/MoE
+        // buffers in sequence, so they add (not max) within one layer.
+        long needed = Math.Max(linInternal, fullInternal) + moeInternal + ffnScratch + normScratch + 4 * 1024 * 1024;
         if (_scratch == null || (long)_scratch.Bytes < needed)
             _scratch = Rent((nuint)needed);
     }
@@ -353,6 +436,8 @@ public sealed unsafe partial class Qwen35Model : IDisposable
 
     // Weight is a struct that packs the raw pointer for whatever quant format
     // a tensor happens to have; the dispatch helpers switch on Type.
+    // For 3D MoE tensors (experts), pointers address the first expert's block
+    // and NExpert / ExpertStride describe the layout.
     private struct Weight
     {
         public GgmlTensorType Type;
@@ -366,9 +451,12 @@ public sealed unsafe partial class Qwen35Model : IDisposable
         public BlockSTQ1_0* STQ;
         public BlockSTQ1_0x8* PackedSTQ;
         public BlockQ6Kx8* Packed6;
+        public BlockIQ4XS* Q4xs;
         public float* F32;
         public int NIn;
         public int NOut;
+        public int NExpert;
+        public long ExpertStride; // byte offset between experts for 3D tensors
         public int Count;
     }
 
@@ -388,6 +476,7 @@ public sealed unsafe partial class Qwen35Model : IDisposable
 
             int nIn = (int)info.Shape[0];
             int nOut = info.Shape.Length > 1 ? (int)info.Shape[1] : 1;
+            int nExpert = info.Shape.Length > 2 ? (int)info.Shape[2] : 1;
             if (nIn % Qk.SuperBlock != 0)
                 throw new NotSupportedException($"{name}: nIn={nIn} is not a multiple of 256");
             int nb = info.Type switch
@@ -401,22 +490,25 @@ public sealed unsafe partial class Qwen35Model : IDisposable
                 GgmlTensorType.Q4_K => Qk.Q4KSize,
                 GgmlTensorType.Q5_K => Qk.Q5KSize,
                 GgmlTensorType.Q6_K => Qk.Q6KSize,
+                GgmlTensorType.IQ4_XS => Qk.IQ4XSSize,
                 GgmlTensorType.Q2_0C => Qk.Q2_0CSize,
                 GgmlTensorType.STQ1_0 => Qk.STQ1_0Size,
                 _ => throw new NotSupportedException($"Unsupported quantized tensor type {info.Type} for {name}"),
             };
-            NativeBuffer quant = Rent((nuint)((long)nOut * nb * blockBytes));
+            NativeBuffer quant = Rent((nuint)((long)nOut * nExpert * nb * blockBytes));
             Buffer.MemoryCopy(data, quant.Pointer, quant.Bytes, quant.Bytes);
             Weight w = new()
             {
                 Type = info.Type,
                 NIn = nIn,
                 NOut = nOut,
+                NExpert = nExpert,
+                ExpertStride = (long)nOut * nb * blockBytes,
             };
             if (info.Type == GgmlTensorType.Q4_K)
             {
                 NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q4Kx8Size));
-                if (nOut >= 8)
+                if (nOut >= 8 && nExpert == 1)
                 {
                     RepackQ4K.Rows((BlockQ4K*)quant.Pointer, (BlockQ4Kx8*)packed.Pointer, nIn, nOut & ~7);
                     NativeBuffer meta = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q4Kx8MetaSize));
@@ -430,12 +522,16 @@ public sealed unsafe partial class Qwen35Model : IDisposable
             {
                 w.Q5 = (BlockQ5K*)quant.Pointer;
             }
+            else if (info.Type == GgmlTensorType.IQ4_XS)
+            {
+                w.Q4xs = (BlockIQ4XS*)quant.Pointer;
+            }
             else
             {
                 if (info.Type == GgmlTensorType.Q2_0C)
                 {
                     w.Q2 = (BlockQ2_0C*)quant.Pointer;
-                    if (nOut >= 8)
+                    if (nOut >= 8 && nExpert == 1)
                     {
                         NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q2x8Size));
                         RepackQ2.Rows(w.Q2, (BlockQ2x8*)packed.Pointer, nIn, nOut & ~7);
@@ -445,7 +541,7 @@ public sealed unsafe partial class Qwen35Model : IDisposable
                 else if (info.Type == GgmlTensorType.STQ1_0)
                 {
                     w.STQ = (BlockSTQ1_0*)quant.Pointer;
-                    if (nOut >= 8)
+                    if (nOut >= 8 && nExpert == 1)
                     {
                         NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.STQ1_0x8Size));
                         RepackSTQ.Rows(w.STQ, (BlockSTQ1_0x8*)packed.Pointer, nIn, nOut & ~7);
@@ -455,7 +551,7 @@ public sealed unsafe partial class Qwen35Model : IDisposable
                 else
                 {
                     w.Q6 = (BlockQ6K*)quant.Pointer;
-                    if (nOut >= 8)
+                    if (nOut >= 8 && nExpert == 1)
                     {
                         NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q6Kx8Size));
                         RepackQ6K.Rows(w.Q6, (BlockQ6Kx8*)packed.Pointer, nIn, nOut & ~7);

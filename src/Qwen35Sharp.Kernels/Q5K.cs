@@ -91,7 +91,12 @@ public static unsafe class Q5K
         int nb = nIn / Qk.SuperBlock;
         using NativeBuffer q8 = new((nuint)Q8K.RowBytes(nIn));
         Q8K.QuantizeRow(input, (BlockQ8K*)q8.Pointer, nIn);
-        BlockQ8K* y = (BlockQ8K*)q8.Pointer;
+        GemvPrequant(weights, (BlockQ8K*)q8.Pointer, output, nIn, nOut, pool);
+    }
+
+    public static void GemvPrequant(BlockQ5K* weights, BlockQ8K* y, float* output, int nIn, int nOut, CpuThreadPool? pool = null)
+    {
+        int nb = nIn / Qk.SuperBlock;
         void Body(int worker, int workers)
         {
             int begin = nOut * worker / workers;

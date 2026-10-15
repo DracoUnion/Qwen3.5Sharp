@@ -31,16 +31,26 @@ public sealed unsafe partial class Qwen35Model
         float* n2 = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         Rms($"blk.{layer}.post_attention_norm.weight", hidden, n2, seq, hiddenSize);
         T("post_attn_norm ok");
-        float* gate = (float*)Bump((nuint)((long)seq * Config.FfnSize * sizeof(float)));
-        float* up = (float*)Bump((nuint)((long)seq * Config.FfnSize * sizeof(float)));
-        float* down = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
-        PrefillGateUp(n2, gate, up, layer, seq);
-        T("gateup ok");
-        Ops.SiLUMul(gate, up, checked((int)((long)seq * Config.FfnSize)), _pool);
-        T("silu ok");
-        Linear(gate, $"blk.{layer}.ffn_down.weight", down, Config.FfnSize, hiddenSize, seq);
-        T("ffn_down ok");
-        Ops.AddInPlace(hidden, down, checked((int)((long)seq * hiddenSize)), _pool);
+        if (Config.IsMoe)
+        {
+            float* moe = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
+            PrefillSparseMoe(n2, moe, layer, seq);
+            T("moe ok");
+            Ops.AddInPlace(hidden, moe, checked((int)((long)seq * hiddenSize)), _pool);
+        }
+        else
+        {
+            float* gate = (float*)Bump((nuint)((long)seq * Config.FfnSize * sizeof(float)));
+            float* up = (float*)Bump((nuint)((long)seq * Config.FfnSize * sizeof(float)));
+            float* down = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
+            PrefillGateUp(n2, gate, up, layer, seq);
+            T("gateup ok");
+            Ops.SiLUMul(gate, up, checked((int)((long)seq * Config.FfnSize)), _pool);
+            T("silu ok");
+            Linear(gate, $"blk.{layer}.ffn_down.weight", down, Config.FfnSize, hiddenSize, seq);
+            T("ffn_down ok");
+            Ops.AddInPlace(hidden, down, checked((int)((long)seq * hiddenSize)), _pool);
+        }
         T("residual2 ok");
     }
 
@@ -193,24 +203,39 @@ public sealed unsafe partial class Qwen35Model
                 cs[j] = qkvCh[(long)c * seq + tailStart + j];
         }
 
-        // 3) Split into q, k, v (seq-major): q [seq, keyDim], k [seq, keyDim],
-        //    v [seq, valueDim].
-        float* q = convOutCh; // not actually seq-major; we need to un-transpose.
-        // Build seq-major q, k, v.
-        float* qSm = (float*)Bump((nuint)((long)seq * keyDim * sizeof(float)));
-        float* kSm = (float*)Bump((nuint)((long)seq * keyDim * sizeof(float)));
+        // 3) Split into q, k, v. The conv output is [keyDim | keyDim | valueDim]
+        //    where keyDim = num_k_heads * head_k_dim and valueDim = num_v_heads * head_v_dim.
+        //    Python repeats q/k heads to match value heads (num_v_heads//num_k_heads).
+        int nKHeads = Config.SsmGroupCount;
+        int nVHeads = Config.SsmTimeStepRank;
+        int repeat = nVHeads / nKHeads;
+        // qSm/kSm each have [seq, nVHeads * headDim] (heads repeated), vSm [seq, valueDim].
+        float* qSm = (float*)Bump((nuint)((long)seq * nHeads * headDim * sizeof(float)));
+        float* kSm = (float*)Bump((nuint)((long)seq * nHeads * headDim * sizeof(float)));
         float* vSm = (float*)Bump((nuint)((long)seq * valueDim * sizeof(float)));
         for (int t = 0; t < seq; t++)
         {
-            for (int d = 0; d < keyDim; d++)
-                qSm[(long)t * keyDim + d] = convOutCh[(long)d * seq + t];
-            for (int d = 0; d < keyDim; d++)
-                kSm[(long)t * keyDim + d] = convOutCh[(long)(keyDim + d) * seq + t];
+            for (int kh = 0; kh < nKHeads; kh++)
+            {
+                for (int rep = 0; rep < repeat; rep++)
+                {
+                    int vh = kh * repeat + rep;
+                    for (int d = 0; d < headDim; d++)
+                    {
+                        qSm[(long)t * nHeads * headDim + vh * headDim + d] =
+                            convOutCh[(long)(kh * headDim + d) * seq + t];
+                        kSm[(long)t * nHeads * headDim + vh * headDim + d] =
+                            convOutCh[(long)(keyDim + kh * headDim + d) * seq + t];
+                    }
+                }
+            }
             for (int d = 0; d < valueDim; d++)
                 vSm[(long)t * valueDim + d] = convOutCh[(long)(2 * keyDim + d) * seq + t];
         }
 
-        // 4) beta = sigmoid(bOut), g = -exp(A_log) * softplus(a + dt_bias).
+        // 4) beta = sigmoid(bOut), g = ssm_a * softplus(a + dt_bias).
+        // ssm_a is already -exp(A_log) (llama.cpp stores the baked -exp), so no
+        // exp here — gate = softplus(alpha + dt_bias) * ssm_a, which is <= 0.
         float* betaP = (float*)Bump((nuint)((long)seq * nHeads * sizeof(float)));
         Qwen35Ops.Sigmoid(bOut, betaP, (int)((long)seq * nHeads));
         float* gP = (float*)Bump((nuint)((long)seq * nHeads * sizeof(float)));
@@ -219,7 +244,7 @@ public sealed unsafe partial class Qwen35Model
         for (int i = 0; i < seq * nHeads; i++)
         {
             int head = i % nHeads;
-            gP[i] = -MathF.Exp(aLog[head]) * Qwen35Ops.SoftplusScalar(aOut[i] + dtBias[head]);
+            gP[i] = aLog[head] * Qwen35Ops.SoftplusScalar(aOut[i] + dtBias[head]);
         }
 
         // 5) Recurrence for the whole sequence.

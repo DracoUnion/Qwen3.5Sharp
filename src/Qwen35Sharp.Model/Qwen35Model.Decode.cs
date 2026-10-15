@@ -14,6 +14,15 @@ public sealed unsafe partial class Qwen35Model
     {
         if (!_weights.TryGetValue(name, out Weight w) && fallback != null)
             _weights.TryGetValue(fallback, out w);
+        if (w.Type == GgmlTensorType.F32 && w.F32 == null)
+            throw new InvalidOperationException($"Linear missing weight data for '{name}' (fallback={fallback})");
+        Linear(w, input, output, nIn, nOut, tokens);
+    }
+
+    private void Linear(Weight w, float* input, float* output, int nIn, int nOut, int tokens)
+    {
+        if (w.Type == GgmlTensorType.F32 && w.F32 == null)
+            throw new InvalidOperationException("F32 linear with null F32 pointer; weight missing or mis-loaded.");
         switch (w.Type)
         {
             case GgmlTensorType.Q4_K:
@@ -31,14 +40,24 @@ public sealed unsafe partial class Qwen35Model
             case GgmlTensorType.Q6_K:
                 Q6K.Gemm(w.Q6, input, output, nIn, nOut, tokens, _pool, _gemmScratch);
                 break;
+            case GgmlTensorType.IQ4_XS:
+                IQ4XS.Gemm(w.Q4xs, input, output, nIn, nOut, tokens, _pool);
+                break;
+            case GgmlTensorType.F32:
+                F32Gemm(w.F32, input, output, nIn, nOut, tokens);
+                break;
             default:
-                throw new NotSupportedException($"{name} type {w.Type} cannot be used as a linear weight.");
+                throw new NotSupportedException($"{w.Type} cannot be used as a linear weight.");
         }
     }
 
     private void DecodeLinear(float* input, string name, float* output, int nIn, int nOut)
     {
-        Weight w = _weights[name];
+        DecodeLinear(_weights[name], input, output, nIn, nOut);
+    }
+
+    private void DecodeLinear(Weight w, float* input, float* output, int nIn, int nOut)
+    {
         switch (w.Type)
         {
             case GgmlTensorType.Q4_K:
@@ -53,8 +72,17 @@ public sealed unsafe partial class Qwen35Model
             case GgmlTensorType.Q6_K:
                 Q6K.Gemv(w.Q6, input, output, nIn, nOut, _pool, _gemmScratch);
                 break;
+            case GgmlTensorType.Q5_K:
+                Q5K.Gemv(w.Q5, input, output, nIn, nOut, _pool);
+                break;
+            case GgmlTensorType.IQ4_XS:
+                IQ4XS.Gemv(w.Q4xs, input, output, nIn, nOut, _pool);
+                break;
+            case GgmlTensorType.F32:
+                F32Gemm(w.F32, input, output, nIn, nOut, 1);
+                break;
             default:
-                throw new NotSupportedException($"{name} type {w.Type} is not a decode GEMV weight.");
+                throw new NotSupportedException($"{w.Type} is not a decode GEMV weight.");
         }
     }
 
@@ -68,6 +96,15 @@ public sealed unsafe partial class Qwen35Model
             case GgmlTensorType.STQ1_0:
                 MulMatSTQ.GemvPrequant(w.PackedSTQ, w.STQ, x, y, nIn, nOut, _pool);
                 break;
+            case GgmlTensorType.IQ4_XS:
+                IQ4XS.GemvPrequant(w.Q4xs, x, y, nIn, nOut, _pool);
+                break;
+            case GgmlTensorType.Q5_K:
+                Q5K.GemvPrequant(w.Q5, x, y, nIn, nOut, _pool);
+                break;
+            case GgmlTensorType.Q6_K:
+                Q6K.GemvPrequant(w.Q6, x, y, nIn, nOut, _pool);
+                break;
             default:
                 MulMatQ4K.GemvPrequant(w.Q4, x, y, nIn, nOut, _pool);
                 break;
@@ -77,13 +114,29 @@ public sealed unsafe partial class Qwen35Model
     private void Rms(string name, float* x, float* y, int rows, int dim)
     {
         Weight w = _weights[name];
-        Ops.RmsNorm(x, w.F32, y, rows, dim, Config.Eps, _pool);
+        Qwen35Ops.RmsNormZeroCentered(x, w.F32, y, rows, dim, Config.Eps, _pool);
     }
 
     private void RmsSerial(string name, float* x, float* y, int rows, int dim)
     {
         Weight w = _weights[name];
-        Ops.RmsNorm(x, w.F32, y, rows, dim, Config.Eps, pool: null);
+        Qwen35Ops.RmsNormZeroCentered(x, w.F32, y, rows, dim, Config.Eps, pool: null);
+    }
+
+    /// <summary>
+    /// Plain F32 <c>y = x @ W^T</c> for weights stored F32 in the GGUF (e.g. the
+    /// MoE router). <paramref name="w"/> is row-major with <c>nIn</c> innermost:
+    /// <c>W[i + o*nIn]</c>. Used for small tensors (router, shared gate).
+    /// </summary>
+    private void F32Gemm(float* w, float* input, float* output, int nIn, int nOut, int tokens)
+    {
+        for (int t = 0; t < tokens; t++)
+        {
+            float* x = input + (long)t * nIn;
+            float* y = output + (long)t * nOut;
+            for (int o = 0; o < nOut; o++)
+                y[o] = Ops.DotF32(x, w + (long)o * nIn, nIn);
+        }
     }
 
     private void Embed(int[] tokens, float* dest)
@@ -113,6 +166,9 @@ public sealed unsafe partial class Qwen35Model
                     break;
                 case GgmlTensorType.STQ1_0:
                     STQ1_0.DequantizeRow(w.STQ + tokens[t] * (hidden / STQ1_0.BlockLength), row, hidden);
+                    break;
+                case GgmlTensorType.IQ4_XS:
+                    IQ4XS.DequantizeRow(w.Q4xs + tokens[t] * nb, row, hidden);
                     break;
                 case GgmlTensorType.F32:
                     Buffer.MemoryCopy(w.F32 + tokens[t] * hidden, row, hidden * sizeof(float), hidden * sizeof(float));
@@ -177,13 +233,22 @@ public sealed unsafe partial class Qwen35Model
 
         float* n2 = (float*)Bump((nuint)hiddenSize * sizeof(float));
         RmsSerial($"blk.{layer}.post_attention_norm.weight", hidden, n2, seq, hiddenSize);
-        float* gate = (float*)Bump((nuint)((long)Config.FfnSize * sizeof(float)));
-        float* up = (float*)Bump((nuint)((long)Config.FfnSize * sizeof(float)));
-        float* down = (float*)Bump((nuint)hiddenSize * sizeof(float));
-        DecodeGateUp(n2, gate, up, layer);
-        Ops.SiLUMul(gate, up, Config.FfnSize, pool: null);
-        DecodeLinear(gate, $"blk.{layer}.ffn_down.weight", down, Config.FfnSize, hiddenSize);
-        Ops.AddInPlace(hidden, down, hiddenSize, pool: null);
+        if (Config.IsMoe)
+        {
+            float* moe = (float*)Bump((nuint)hiddenSize * sizeof(float));
+            DecodeSparseMoe(n2, moe, layer);
+            Ops.AddInPlace(hidden, moe, hiddenSize, pool: null);
+        }
+        else
+        {
+            float* gate = (float*)Bump((nuint)((long)Config.FfnSize * sizeof(float)));
+            float* up = (float*)Bump((nuint)((long)Config.FfnSize * sizeof(float)));
+            float* down = (float*)Bump((nuint)hiddenSize * sizeof(float));
+            DecodeGateUp(n2, gate, up, layer);
+            Ops.SiLUMul(gate, up, Config.FfnSize, pool: null);
+            DecodeLinear(gate, $"blk.{layer}.ffn_down.weight", down, Config.FfnSize, hiddenSize);
+            Ops.AddInPlace(hidden, down, hiddenSize, pool: null);
+        }
     }
 
     private void DecodeGateUp(float* input, float* gate, float* up, int layer)
@@ -284,19 +349,41 @@ public sealed unsafe partial class Qwen35Model
         float* convOut = (float*)Bump((nuint)convDim * sizeof(float));
         GatedDeltaNetOps.CausalConv1dUpdate(qkv, ConvKernel(layer), Config.SsmConvKernel, convDim, _linConv[layer], convOut);
 
-        // 3) Split into q, k, v.
-        float* q = convOut;
-        float* k = convOut + keyDim;
-        float* v = convOut + keyDim * 2;
+        // 3) Split into q, k, v, repeating q/k heads to match value heads
+        //    (num_v_heads // num_k_heads), per the reference implementation.
+        int nKHeads = Config.SsmGroupCount;
+        int nVHeads = Config.SsmTimeStepRank;
+        int repeat = nVHeads / nKHeads;
+        float* q = (float*)Bump((nuint)((long)nHeads * headDim * sizeof(float)));
+        float* k = (float*)Bump((nuint)((long)nHeads * headDim * sizeof(float)));
+        float* v = (float*)Bump((nuint)valueDim * sizeof(float));
+        float* rawQ = convOut;
+        float* rawK = convOut + keyDim;
+        float* rawV = convOut + keyDim * 2;
+        for (int kh = 0; kh < nKHeads; kh++)
+        {
+            for (int rep = 0; rep < repeat; rep++)
+            {
+                int vh = kh * repeat + rep;
+                for (int d = 0; d < headDim; d++)
+                {
+                    q[vh * headDim + d] = rawQ[kh * headDim + d];
+                    k[vh * headDim + d] = rawK[kh * headDim + d];
+                }
+            }
+        }
+        for (int d = 0; d < valueDim; d++)
+            v[d] = rawV[d];
 
-        // 4) beta = sigmoid(bOut); g = -exp(A_log) * softplus(a + dt_bias).
+        // 4) beta = sigmoid(bOut), g = ssm_a * softplus(a + dt_bias).
+        // ssm_a is already -exp(A_log) in the GGUF, so no exp here.
         float* betaP = (float*)Bump((nuint)nHeads * sizeof(float));
         Qwen35Ops.Sigmoid(bOut, betaP, nHeads);
         float* gP = (float*)Bump((nuint)nHeads * sizeof(float));
         float* aLog = WeightF32($"blk.{layer}.ssm_a");
         float* dtBias = WeightF32($"blk.{layer}.ssm_dt.bias");
         for (int i = 0; i < nHeads; i++)
-            gP[i] = -MathF.Exp(aLog[i]) * Qwen35Ops.SoftplusScalar(aOut[i] + dtBias[i]);
+            gP[i] = aLog[i] * Qwen35Ops.SoftplusScalar(aOut[i] + dtBias[i]);
 
         // 5) Recurrence step for one token.
         float* state = _linState[layer];

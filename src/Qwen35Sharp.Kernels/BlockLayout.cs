@@ -16,6 +16,7 @@ public static class Qk
     public const int Q8Kx4Size = 1168;
     public const int Q5KSize = 176;
     public const int Q6KSize = 210;
+    public const int IQ4XSSize = 136;
     public const int Q6Kx8Size = 2848;
     public const int Q2_0CSize = 130;
     public const int Q2x8Size = 1056;
@@ -52,6 +53,16 @@ public unsafe struct BlockQ5K
     public fixed byte Scales[Qk.ScaleBytes];
     public fixed byte Qh[Qk.SuperBlock / 8];
     public fixed byte Qs[Qk.SuperBlock / 2];
+}
+
+/// <summary>IQ4_XS super-block of 256 values (8 sub-blocks of 32).</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockIQ4XS
+{
+    public ushort D;              // fp16 grid scale
+    public ushort ScalesH;        // high 2 bits of each of the 8 sub-block scales
+    public fixed byte ScalesL[Qk.SuperBlock / 64]; // low 4 bits of each of the 8 sub-block scales
+    public fixed byte Qs[Qk.SuperBlock / 2];       // 4-bit values (2 per byte)
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 1)]

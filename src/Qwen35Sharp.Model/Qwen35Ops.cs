@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using Flygon.Kernels;
 
 namespace Flygon.Model;
 
@@ -10,6 +11,59 @@ namespace Flygon.Model;
 /// </summary>
 public static unsafe class Qwen35Ops
 {
+    /// <summary>
+    /// Zero-centered RMSNorm (Qwen3/Qwen3.5): <c>y = x * rsqrt(mean(x^2) + eps) * (1 + w)</c>.
+    /// Used for the decoder input/post-attention norms, the final norm, and the
+    /// per-head Q/K norms. Differs from the HyMT2Sharp Llama-style RmsNorm
+    /// (<c>x * rsqrt * w</c>) — Qwen3.5 initializes the weight to zeros so
+    /// <c>1 + w</c> is the multiplier.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void RmsNormZeroCentered(float* x, float* weight, float* y, int rows, int dim, float eps, CpuThreadPool? pool = null)
+    {
+        if (pool == null || rows <= 1)
+        {
+            RmsNormZeroCenteredRange(x, weight, y, 0, rows, dim, eps);
+            return;
+        }
+
+        pool.For(rows, (int worker, int workers) =>
+        {
+            int begin = rows * worker / workers;
+            int end = rows * (worker + 1) / workers;
+            RmsNormZeroCenteredRange(x, weight, y, begin, end, dim, eps);
+        });
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void RmsNormZeroCenteredRange(float* x, float* weight, float* y, int begin, int end, int dim, float eps)
+    {
+        for (int r = begin; r < end; r++)
+        {
+            float* src = x + (long)r * dim;
+            float* dst = y + (long)r * dim;
+            float sum = 0;
+            int i = 0;
+            if (Avx.IsSupported)
+            {
+                Vector256<float> acc = Vector256<float>.Zero;
+                for (; i <= dim - 8; i += 8)
+                {
+                    Vector256<float> v = Avx.LoadVector256(src + i);
+                    acc = Fma.IsSupported ? Fma.MultiplyAdd(v, v, acc) : Avx.Add(acc, Avx.Multiply(v, v));
+                }
+                sum = Flygon.Kernels.VecDotQ4K.HorizontalSum(acc);
+            }
+            for (; i < dim; i++)
+                sum += src[i] * src[i];
+            float scale = 1f / MathF.Sqrt(sum / dim + eps);
+            for (i = 0; i < dim; i++)
+            {
+                float w = weight != null ? weight[i] : 0f;
+                dst[i] = src[i] * scale * (1f + w);
+            }
+        }
+    }
     /// <summary>
     /// Gated RMSNorm: <c>y = (x * rsqrt(mean(x^2) + eps) * weight) * silu(gate)</c>.
     /// <paramref name="x"/> and <paramref name="y"/> are length <c>rows*dim</c>;
