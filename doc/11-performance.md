@@ -1,5 +1,18 @@
 # 11. 性能设计与剖析
 
+> **读者导航（大白话）**：这一章讲"怎么看见时间花在哪，以及优化时的六板斧"。三个工具：静态 `Ticks*` 计数器、`Q35_TRACE`/`Q35_DIAG` 环境变量、以及贯穿全书的性能设计决策清单。
+
+```mermaid
+graph TD
+    A["ProfileEnabled = true"] --> B["各算子 Stopwatch 包裹"]
+    B --> C["Ticks* 累加（decode 路径）"]
+    C --> D["ResetProfile 清零后重测"]
+    D --> E["Ticks*/Frequency → 算子耗时分布"]
+    E --> F["找出最大耗时算子 → 优化目标"]
+    TR["Q35_TRACE=1 逐层留痕"] --> G["定位流程卡点"]
+    DG["Q35_DIAG=1 逐层范数"] --> H["定位数值发散层"]
+```
+
 ## 11.1 性能设计要点回顾
 
 1. **加载期重打包**：GGUF 权重一次重排成 panel（Q4Kx8/Q6Kx8/Q2x8/STQ1_0x8）

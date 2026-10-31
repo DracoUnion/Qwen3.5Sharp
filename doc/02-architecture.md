@@ -1,5 +1,24 @@
 # 2. 总体架构
 
+> **读者导航（大白话）**：这一章是"施工蓝图签到表"——谁在上层、谁在下层、一次推理数据怎么流。**2.1/2.2** 看分层，**2.3** 看数据流，**2.4** 看七个关键设计决策（D1–D7），每一个都对应 `src/` 里的真实代码。
+
+```mermaid
+graph BT
+    subgraph 上层
+        CLI["Qwen35Sharp.Cli<br/>Program.cs：参数 / REPL / 输出"]
+    end
+    subgraph 中层
+        MODEL["Qwen35Sharp.Model<br/>ModelConfig · Qwen35Model · BpeTokenizer · ChatTemplate"]
+    end
+    subgraph 底层
+        KERN["Qwen35Sharp.Kernels<br/>VecDotQ4K · GemmQ4K · CpuThreadPool · ScratchArena"]
+        GGUF["Qwen35Sharp.Gguf<br/>GgufFile · GgmlTensorType"]
+    end
+    CLI --> MODEL
+    MODEL --> KERN
+    MODEL --> GGUF
+```
+
 ## 2.1 分层与依赖
 
 ```
@@ -37,6 +56,27 @@
 | `Tests` | xunit 单元测试与对拍测试 | `FastExpTests`, `GatedDeltaNetOpsTests`, `GgufTypeTests`, `IQ4XSTests`, `KvCacheAlignTests` |
 
 ## 2.3 一次推理（自回归一步）的数据流
+
+```mermaid
+graph TD
+    TXT["用户文本"] --> TOK["BpeTokenizer.Encode<br/>→ token ids"]
+    TOK --> AL["KvCacheAlign.Plan<br/>前缀复用（多轮）"]
+    AL --> FWD["Qwen35Model.Forward(suffix)"]
+    FWD --> EMB["Embed<br/>token → hidden 向量"]
+    EMB --> BLK["逐层 DecodeBlock / PrefillBlock"]
+    BLK --> MIX{"token 混合器"}
+    MIX -->|"全注意力"| FA["q\|gate/k/v → RoPE → 头 RMSNorm<br/>→ AttentionScores → SoftmaxCausal<br/>→ AttentionCombine → 门控 → 输出投影"]
+    MIX -->|"线性注意力"| LA["qkv → 卷积(SiLU) → β/α<br/>→ delta-rule 递推 → 门控 RMSNorm → 输出投影"]
+    FA --> RES1["+ 残差"]
+    LA --> RES1
+    RES1 --> FFN{"FFN"}
+    FFN -->|"dense"| DFFN["gate/up 共享 Q8 → SiLU → down → +残差"]
+    FFN -->|"MoE"| MFFN["router → top-k → 逐专家 GEMV → 共享专家 → +残差"]
+    BLK --> ON["output_norm"]
+    ON --> LM["Linear(output.weight)<br/>→ logits[vocab]"]
+    LM --> AM["ArgMax 贪心 → 下一个 token id"]
+    AM --> FWD
+```
 
 ```
 用户文本

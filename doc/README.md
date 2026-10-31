@@ -4,6 +4,30 @@
 的技术设计与实现说明，涵盖 GGUF 读取、量化内核、模型前向、MoE、分词器、运行时
 与测试。
 
+> **读者导航（大白话）**：本目录是配套《从零自制大模型推理引擎》一书的**设计拆解**。
+> 适合先看 `01`（整体长什么样）与 `02`（怎么分模块），再按"文件 → 内核 → 模型 →
+> 前后端 → 测试 → 性能"的顺序深入。每一章都贴出**真实类名与函数**，可对照 `src/`
+> 源码阅读；关键流程配 mermaid 图。
+
+## 章节总览（一张图看懂 12 章的关系）
+
+```mermaid
+graph LR
+    A["01/02 概述与架构"] --> B["03 GGUF 读取<br/>GgufFile"]
+    A --> C["04 量化格式<br/>BlockLayout"]
+    B --> D["05/06 计算内核<br/>VecDotQ4K / GemmQ4K"]
+    C --> D
+    D --> E["07 线程与内存<br/>CpuThreadPool"]
+    A --> F["08 模型装配<br/>ModelConfig / LoadWeights"]
+    E --> F
+    F --> G["09 前向计算<br/>Forward / PrefillBlock / DecodeBlock"]
+    G --> H["10 全注意力 / 11 Gated-DeltaNet"]
+    H --> I["12 MoE"]
+    I --> J["13 分词与 CLI<br/>BpeTokenizer / Program"]
+    J --> K["14 测试 / 15 性能"]
+    K --> L["17 边界与未来"]
+```
+
 ## 章节导航
 
 | 章节 | 内容 |

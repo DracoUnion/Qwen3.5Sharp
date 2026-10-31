@@ -1,5 +1,16 @@
 # 1. 项目概述
 
+> **读者导航（大白话）**：这一章回答"我们到底要造一个什么东西"。先看清楚**定位**（1.1）、**模型长什么样**（1.2）、**设计目标**（1.3），再对照**技术栈与目录结构**（1.5）就能开工。
+
+```mermaid
+graph TD
+    GG["GGUF 权重文件"] --> R["Qwen35Sharp.Gguf<br/>读取文件"]
+    R --> M["Qwen35Sharp.Model<br/>模型装配与前向"]
+    M --> K["Qwen35Sharp.Kernels<br/>量化 GEMM/GEMV"]
+    M --> U["Qwen35Sharp.Cli<br/>对话界面"]
+    T["tests 测试"] -.->|锁住正确性| M
+```
+
 ## 1.1 项目定位
 
 Qwen35Sharp 是一个纯 CPU 的 C# / .NET 10 推理引擎，直接从一个 `.gguf` 权重文件
@@ -16,6 +27,23 @@ Qwen3.5 是一种混合（hybrid）Transformer，每隔 N 层（`full_attention_
 Qwen3.5 中为 4；从 1 开始计数，即层 3、7、11、…）插入一层标准 GQA 全注意力层，
 其余层为 **Gated-DeltaNet** 线性注意力层（又称 gated SSM）。每层之后跟一个 SiLU
 门控 FFN（dense 或 MoE）。
+
+```mermaid
+graph TD
+    H0["hidden 向量"] --> N1["attn_norm（RMSNorm）"]
+    N1 --> M{"这一层是哪种 token 混合器？<br/>看张量：有 attn_qkv → 线性层，<br/>有 attn_q → 全注意力"}
+    M -->|"线性注意力（其余层）"| L["Gated-DeltaNet<br/>卷积 + delta-rule 递推"]
+    M -->|"全注意力（层3、7、11…）"| F["标准 GQA 全注意力<br/>q/gate/k/v + RoPE + sigmoid 门控"]
+    L --> P1["+hidden 残差"]
+    F --> P1
+    P1 --> N2["post_attention_norm"]
+    N2 --> FFN{"FFN 是哪种？"}
+    FFN -->|"dense"| D["SiLU-MLP gate/up/down"]
+    FFN -->|"qwen35moe"| MOE["稀疏 MoE：router → top-k → 专家"]
+    D --> P2["+hidden 残差"]
+    MOE --> P2
+    P2 --> NEXT["下一层"]
+```
 
 任意一层 `L` 的统一结构：
 

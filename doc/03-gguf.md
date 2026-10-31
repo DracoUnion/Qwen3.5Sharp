@@ -1,5 +1,17 @@
 # 3. GGUF 读取器（`Qwen35Sharp.Gguf`）
 
+> **读者导航（大白话）**：这一章讲"模型文件长什么样、怎么把它安全读进内存"。逐个文件看：`GgufFile.cs`（读取器 + 游标 + 类型规范化）、`GgmlTensorType.cs`（类型枚举）、`GgufTensorInfo.cs`（张量目录）。配套单测在 `tests/GgufTypeTests.cs`。
+
+```mermaid
+graph TD
+    FILE["GGUF 文件"] --> MMF["MemoryMappedFile 内存映射<br/>（不真正读入，按需取页）"]
+    MMF --> P["GgufFile.Parse<br/>用 Cursor 顺序扫头部"]
+    P --> KV["元数据字典 _kv<br/>GetString / GetInt32 / GetFloat32..."]
+    P --> TS["张量目录 Tensors<br/>名字 → GgufTensorInfo"]
+    KV --> AL["读 general.alignment<br/>算出 DataBase"]
+    TS --> USE["下游用 DataBase + Offset 定位权重"]
+```
+
 ## 3.1 职责
 
 `Qwen35Sharp.Gguf` 是文件格式层，把 GGUF v2/v3 二进制文件的字节暴露成：
@@ -13,6 +25,18 @@
 完成。
 
 ## 3.2 文件格式（GGUF v2/v3）
+
+```mermaid
+graph TD
+    A["magic 'GGUF' (u32)"] --> B["version (u32)"]
+    B --> C["tensor_count (u64)"]
+    C --> D["kv_count (u64)"]
+    D --> E["kv 条目 × kv_count<br/>（含 general.alignment）"]
+    E --> F["张量信息 × tensor_count"]
+    F --> G["pad 到 alignment"]
+    G --> H["数据段（权重字节）<br/>起点 = DataBase"]
+    style H fill:#dfd
+```
 
 GGUF 布局（与 llama.cpp `gguf.h` 一致）：
 

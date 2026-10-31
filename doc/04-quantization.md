@@ -1,5 +1,16 @@
 # 4. 量化格式与数据布局（`BlockLayout.cs` + 各格式内核）
 
+> **读者导航（大白话）**：这一章解释"模型为什么能压缩到那么小"。核心思想：**256 个值共用一套缩放比例，每个值只存一个很小的"系数"**（4位/5位/6位/2位…）。逐个格式看：Q4_K、Q8_K（激活）、Q5_K、Q6_K、Q2_0C、STQ1_0、IQ4_XS，以及第 6 章 panel 重打包的"源格式"。真实代码都在 `src/Qwen35Sharp.Kernels/`。
+
+```mermaid
+graph TD
+    A["256 个原始 f32"] --> B["① 记一个全局尺度 D"]
+    A --> C["② 每个值压成 k bit 系数"]
+    B --> D["解码：真实值 ≈ D × 系数（- min 修正）"]
+    C --> D
+    D --> E["Q4_K/Q5_K/Q6_K/Q8_K/Q2_0C/STQ1_0/IQ4_XS<br/>各格式只是 k 与尺度粒度不同"]
+```
+
 所有 K 系格式共享 **super-block = 256 个值**。`Qk` 静态类集中定义尺寸常量与
 `Qk.SuperBlock`。块结构体全部 `[StructLayout(LayoutKind.Sequential, Pack = 1)]`
 以便按字节精确对齐 GGUF 中相应块。
@@ -28,6 +39,15 @@
 ## 4.2 源格式（GGUF 磁盘布局）
 
 ### Q4_K —— `BlockQ4K`（144 B/块）
+
+```mermaid
+graph TD
+    B["BlockQ4K 144 字节<br/>256 个值"] --> D["D (u16 fp16)<br/>全局尺度"]
+    B --> DM["Dmin (u16 fp16)<br/>全局最小值"]
+    B --> S["Scales[12]<br/>8 子块 scale/min 6-bit 打包"]
+    B --> Q["Qs[128]<br/>128 字节 = 256 个 4-bit，每字节 2 个"]
+    S --> SEM["解码一行：<br/>对子块g: d1=D*scale_g, m1=Dmin*min_g<br/>y=d1*nibble - m1"]
+```
 
 ```
 D (u16 fp16)  Dmin (u16 fp16)  Scales[12]  Qs[128]

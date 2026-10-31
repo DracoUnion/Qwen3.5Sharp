@@ -1,5 +1,18 @@
 # 8. MoE 稀疏 FFN（`Qwen35Model.Moe.cs`，arch `qwen35moe`）
 
+> **读者导航（大白话）**：这一章讲"点菜"——一个路由器（router）先给几百个专家打分，只叫醒前 k 个专家干活，最后加权拼菜。核心函数在 `Qwen35Model.Moe.cs`：`PrefillSparseMoe` / `DecodeSparseMoe` / `TopKSoftmax` / `ExpertGateUp` / `ExpertDown` / `ExpertBase`。
+
+```mermaid
+graph TD
+    X["hidden 向量"] --> RT["Linear(ffn_gate_inp)<br/>router 给所有专家打分"]
+    RT --> TK["TopKSoftmax<br/>softmax → 选 top-k → 权重重归一化"]
+    TK --> EX["对每个被选中专家 exp：<br/>ExpertGateUp(x, exp) → SiLU → ExpertDown(x, exp)<br/>output += w · down"]
+    X --> SH{"有共享专家 ffn_gate_shexp?"}
+    SH -->|"有"| SHR["sigmoid(共享门控) · SharedFFN(x)<br/>output += 共享"]
+    EX --> OUT["output"]
+    SHR --> OUT
+```
+
 ## 8.1 数学
 
 ```

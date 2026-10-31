@@ -1,5 +1,19 @@
 # 7. 前向计算（Prefill / Decode）
 
+> **读者导航（大白话）**：这一章讲"引擎的核心发动机"——一次 `Forward` 怎么把 token 变成词分数，以及两种注意力层（全注意力 / Gated-DeltaNet）怎么在预填充（一次读整段）与解码（一次读一个词）两种模式下工作。核心代码：`Qwen35Model.cs`（Forward）、`Qwen35Model.Prefill.cs`、`Qwen35Model.Decode.cs`、`Ops.cs`、`GatedDeltaNetOps.cs`。
+
+```mermaid
+graph TD
+    FK["Forward(tokens)"] --> EB["Embed → h"]
+    FK --> EB
+    EB --> LOOP{"seq == 1 ?"}
+    LOOP -->|"是，decode"| DB["逐层 DecodeBlock"]
+    LOOP -->|"否，prefill"| PB["逐层 PrefillBlock"]
+    DB --> RN["output_norm"]
+    PB --> RN
+    RN --> LM["最后一行 → output.weight → logits"]
+```
+
 ## 7.1 `Forward` 主循环（`Qwen35Model.cs`）
 
 ```

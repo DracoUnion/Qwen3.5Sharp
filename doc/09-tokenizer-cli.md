@@ -1,5 +1,17 @@
 # 9. 分词器、聊天模板与 CLI
 
+> **读者导航（大白话）**：这一章讲用户看到的最外层——"文字 ↔ 编号"（`BpeTokenizer`）、"消息怎么拼成语境"（`ChatTemplate`）、"怎么在终端对话"（`Program.cs` 的 REPL）。读完你会明白 `<|assistant|>` 为什么不能乱切、中文为什么不会乱码。
+
+```mermaid
+graph TD
+    TXT["用户文本"] --> SP["特殊 token 预拆分<br/>（保住 <|assistant|> 等）"]
+    SP --> PT["预分词正则<br/>ResolvePreTokenizer"]
+    PT --> BE["字节编码 ByteEncode<br/>UTF-8 → 可见字符"]
+    BE --> BPE["BPE 合并（查 merges rank）<br/>→ token id"]
+    BPE --> RD["RenderQwen35 模板拼装<br/>→ Encode → Forward"]
+    RD --> RE["Reply 循环<br/>Forward → ArgMax → WriteDelta 流式"]
+```
+
 ## 9.1 字节级 BPE 分词器（`BpeTokenizer.cs`）
 
 完全由 GGUF 的 `tokenizer.ggml.*` 元数据驱动，不依赖外部库。

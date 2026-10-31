@@ -1,5 +1,24 @@
 # 5. 内核与运行时（`Qwen35Sharp.Kernels`）
 
+> **读者导航（大白话）**：这一章讲"让乘法飞快"的所有底层零件：GEMM/GEMV 内核、SIMD 技巧、快速指数、线程池、CPU 拓扑、内存竞技场。核心文件都在 `src/Qwen35Sharp.Kernels/`，一行代码对应一个内核文件。
+
+```mermaid
+graph TD
+    subgraph 计算内核
+        V["VecDotQ4K / Q6K / Q2_0C / IQ4XS / STQ1_0 / Q5K<br/>量化点积（decode）"]
+        G["GemmQ4K / GemmQ6K / Q2Panel / STQPanel<br/>4×8 面板 GEMM（prefill）"]
+    end
+    subgraph 运行时
+        CT["CpuTopology<br/>发现物理 P-core"]
+        CP["CpuThreadPool<br/>job-id 派发 + 自旋 barrier"]
+        NB["NativeBuffer / ScratchArena<br/>64B 对齐内存"]
+    end
+    FE["FastExp<br/>软 exp/silu"] -.-> V
+    V --> CP
+    G --> CP
+    CP --> CT
+```
+
 ## 5.1 GEMM/GEMV 内核总览
 
 | 内核 | 用途 | 路径 |

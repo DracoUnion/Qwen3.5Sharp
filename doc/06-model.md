@@ -1,5 +1,17 @@
 # 6. 模型层基础（`Qwen35Model` 的配置 / 权重 / 分派）
 
+> **读者导航（大白话）**：这一章讲"把文件里的张量认领成模型"。三个主角：`ModelConfig`（超参表）、`Weight`（一块权重，按类型用不同的指针解释）、`LoadWeights`（把每块权重拷进来 + 必要时重打包成面板）。核心代码在 `src/Qwen35Sharp.Model/ModelConfig.cs` 与 `Qwen35Model.cs`。
+
+```mermaid
+graph TD
+    G["GGUF 元数据"] --> C["ModelConfig.FromGguf<br/>→ 超参 + 派生维度 + IsRecurrent"]
+    C --> W["Weight 结构体<br/>按 GgmlTensorType 用不同指针解释同一块内存"]
+    G --> L["LoadWeights<br/>遍历 Tensors → 整段拷贝到 NativeBuffer<br/>→ RepackQ4K/Q6K/Q2/STQ 补面板"]
+    L --> W
+    W --> DISP["Linear / DecodeLinear / GemvPrequant<br/>按 Type switch 分派到内核"]
+    W --> EMB["Embed<br/>token_embd 按行反量化"]
+```
+
 ## 6.1 `ModelConfig`（`ModelConfig.cs`）
 
 从 GGUF 元数据抽取全部超参。架构读取 `general.architecture`，支持 `qwen35` 与
